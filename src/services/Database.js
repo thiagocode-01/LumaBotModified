@@ -13,10 +13,10 @@ const dbPrivate = new Database(pathPrivate);
 const pathMetrics = path.join(DATA_DIR, "luma_metrics.sqlite");
 const dbMetrics = new Database(pathMetrics);
 
-
 dbPrivate.pragma("journal_mode = WAL");
 dbMetrics.pragma("journal_mode = WAL");
 
+// ==================== TABELAS EXISTENTES ====================
 
 dbPrivate.exec(`
   CREATE TABLE IF NOT EXISTS chat_settings (
@@ -26,9 +26,6 @@ dbPrivate.exec(`
   );
 `);
 
-// Perfis de usuário (JID → melhor nome humano disponível).
-// Identidade técnica = jid/lid; o nome é enriquecido ao longo do tempo a partir
-// de mensagens, eventos de contato e metadata de grupo.
 dbPrivate.exec(`
   CREATE TABLE IF NOT EXISTS wa_users (
     jid           TEXT PRIMARY KEY,
@@ -44,8 +41,6 @@ dbPrivate.exec(`
   );
 `);
 
-// Contagem de interações com a Luma (quem mais a aciona).
-// group_jid = '_pv_' para conversas privadas. Contém JIDs → banco privado.
 dbPrivate.exec(`
   CREATE TABLE IF NOT EXISTS luma_interactions (
     group_jid  TEXT NOT NULL,
@@ -57,8 +52,6 @@ dbPrivate.exec(`
   CREATE INDEX IF NOT EXISTS idx_interactions_group ON luma_interactions(group_jid, count DESC);
 `);
 
-// Lembretes agendados. fire_at = epoch ms (UTC). mention_jids = JSON array.
-// Persistido para sobreviver a reinícios do bot.
 dbPrivate.exec(`
   CREATE TABLE IF NOT EXISTS reminders (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,6 +67,31 @@ dbPrivate.exec(`
   CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(fired, fire_at);
 `);
 
+// ==================== NOVAS TABELAS PARA MÉTRICAS DE ÁUDIO ====================
+
+// 🆕 Tabela para métricas por usuário
+dbPrivate.exec(`
+  CREATE TABLE IF NOT EXISTS user_metrics (
+    user_id           TEXT PRIMARY KEY,
+    audios_downloaded INTEGER DEFAULT 0,
+    stickers_created  INTEGER DEFAULT 0,
+    messages_sent     INTEGER DEFAULT 0,
+    last_audio_download DATETIME,
+    last_active       DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+// 🆕 Tabela para métricas temporárias (ex: limites diários)
+dbPrivate.exec(`
+  CREATE TABLE IF NOT EXISTS temp_metrics (
+    key        TEXT PRIMARY KEY,
+    value      INTEGER DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+// ==================== TABELAS EXISTENTES DE MÉTRICAS ====================
+
 dbMetrics.exec(`
   CREATE TABLE IF NOT EXISTS metrics (
     key TEXT PRIMARY KEY,
@@ -87,7 +105,11 @@ dbMetrics.exec(`
   );
 `);
 
+// ==================== CLASSE DatabaseService ====================
+
 export class DatabaseService {
+
+  // ========== MÉTODOS EXISTENTES ==========
 
   static getPersonality(jid) {
     const stmt = dbPrivate.prepare("SELECT personality FROM chat_settings WHERE jid = ?");
@@ -144,15 +166,8 @@ export class DatabaseService {
     });
   }
 
-  // === PERFIS DE USUÁRIO (wa_users) ===
+  // ========== MÉTODOS DE USUÁRIO (EXISTENTES) ==========
 
-  /**
-   * Cria ou enriquece o perfil de um usuário. Campos vazios/undefined nunca
-   * sobrescrevem dados já preenchidos — evita apagar um nome bom com um vazio.
-   * @param {string} jid
-   * @param {{lid?:string, phoneNumber?:string, pushName?:string, contactName?:string,
-   *          notifyName?:string, verifiedName?:string, botNickname?:string}} data
-   */
   static upsertWaUser(jid, data = {}) {
     if (!jid) return;
 
@@ -193,7 +208,6 @@ export class DatabaseService {
     return dbPrivate.prepare("SELECT * FROM wa_users ORDER BY last_seen_at DESC").all();
   }
 
-  /** Define o apelido manual (prioridade máxima na exibição). */
   static setNickname(jid, nickname) {
     if (!jid) return;
     dbPrivate.prepare(`
@@ -204,9 +218,8 @@ export class DatabaseService {
     `).run(jid, nickname);
   }
 
-  // === RANKING DE INTERAÇÕES COM A LUMA (luma_interactions) ===
+  // ========== RANKING (EXISTENTE) ==========
 
-  /** Incrementa o contador de interações de um usuário em um chat. */
   static incrementInteraction(groupJid, senderJid) {
     if (!groupJid || !senderJid) return;
     dbPrivate.prepare(`
@@ -218,7 +231,6 @@ export class DatabaseService {
     `).run(groupJid, senderJid);
   }
 
-  /** Ranking de um chat específico, ordenado por interações. */
   static getGroupRanking(groupJid, limit = 10) {
     return dbPrivate.prepare(`
       SELECT sender_jid, count, last_at FROM luma_interactions
@@ -228,7 +240,6 @@ export class DatabaseService {
     `).all(groupJid, limit);
   }
 
-  /** Ranking global agregado por usuário (soma de todos os chats). */
   static getGlobalRanking(limit = 10) {
     return dbPrivate.prepare(`
       SELECT sender_jid, SUM(count) AS count, MAX(last_at) AS last_at
@@ -239,7 +250,7 @@ export class DatabaseService {
     `).all(limit);
   }
 
-  // === LEMBRETES (reminders) ===
+  // ========== LEMBRETES (EXISTENTE) ==========
 
   static addReminder({ chatJid, isGroup, creatorJid, mentionJids, text, fireAt }) {
     const info = dbPrivate.prepare(`
@@ -249,14 +260,12 @@ export class DatabaseService {
     return info.lastInsertRowid;
   }
 
-  /** Lembretes vencidos ainda não disparados. */
   static getDueReminders(nowMs) {
     return dbPrivate
       .prepare("SELECT * FROM reminders WHERE fired = 0 AND fire_at <= ? ORDER BY fire_at ASC")
       .all(nowMs);
   }
 
-  /** Todos os lembretes pendentes (futuros), para listagem/dashboard. */
   static getPendingReminders() {
     return dbPrivate
       .prepare("SELECT * FROM reminders WHERE fired = 0 ORDER BY fire_at ASC")
@@ -269,5 +278,250 @@ export class DatabaseService {
 
   static deleteReminder(id) {
     dbPrivate.prepare("DELETE FROM reminders WHERE id = ?").run(id);
+  }
+
+  // ========== 🆕 NOVOS MÉTODOS PARA MÉTRICAS DE ÁUDIO ==========
+
+  /**
+   * Atualiza métricas de um usuário específico
+   * @param {string} userId - JID do usuário
+   * @param {Object} data - Dados para atualizar
+   */
+  static updateUserMetric(userId, data = {}) {
+    if (!userId) return;
+
+    // Inserir ou criar usuário
+    dbPrivate
+      .prepare(`
+        INSERT INTO user_metrics (user_id) 
+        VALUES (?) 
+        ON CONFLICT(user_id) DO NOTHING
+      `)
+      .run(userId);
+
+    // Construir a query de update dinamicamente
+    const updates = [];
+    const values = [];
+
+    if (data.audios_downloaded !== undefined) {
+      updates.push("audios_downloaded = audios_downloaded + ?");
+      values.push(data.audios_downloaded);
+    }
+    
+    if (data.stickers_created !== undefined) {
+      updates.push("stickers_created = stickers_created + ?");
+      values.push(data.stickers_created);
+    }
+    
+    if (data.messages_sent !== undefined) {
+      updates.push("messages_sent = messages_sent + ?");
+      values.push(data.messages_sent);
+    }
+
+    if (data.last_audio_download !== undefined) {
+      updates.push("last_audio_download = ?");
+      values.push(data.last_audio_download);
+    }
+
+    updates.push("last_active = CURRENT_TIMESTAMP");
+    values.push(userId);
+
+    if (updates.length > 1) {
+      const stmt = dbPrivate.prepare(`
+        UPDATE user_metrics 
+        SET ${updates.join(", ")} 
+        WHERE user_id = ?
+      `);
+      stmt.run(...values);
+    }
+  }
+
+  /**
+   * Busca métricas de um usuário específico
+   * @param {string} userId - JID do usuário
+   * @returns {Object|null} Métricas do usuário
+   */
+  static getUserMetrics(userId) {
+    if (!userId) return null;
+    return dbPrivate
+      .prepare("SELECT * FROM user_metrics WHERE user_id = ?")
+      .get(userId) || null;
+  }
+
+  /**
+   * Atualiza uma métrica específica (incrementa)
+   * @param {string} key - Nome da métrica
+   * @param {number} value - Valor a incrementar (padrão: 1)
+   */
+  static updateMetric(key, value = 1) {
+    const stmt = dbMetrics.prepare(`
+      INSERT INTO metrics (key, count) 
+      VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET count = count + ?
+    `);
+    stmt.run(key, value, value);
+  }
+
+  /**
+   * Busca uma métrica específica
+   * @param {string} key - Nome da métrica
+   * @returns {number} Valor da métrica
+   */
+  static getMetric(key) {
+    const stmt = dbMetrics.prepare("SELECT count FROM metrics WHERE key = ?");
+    const row = stmt.get(key);
+    return row ? row.count : 0;
+  }
+
+  /**
+   * Busca uma métrica temporária (para limites diários, etc)
+   * @param {string} key - Chave da métrica
+   * @returns {number} Valor da métrica
+   */
+  static getTempMetric(key) {
+    const stmt = dbPrivate.prepare("SELECT value FROM temp_metrics WHERE key = ?");
+    const row = stmt.get(key);
+    return row ? row.value : 0;
+  }
+
+  /**
+   * Define uma métrica temporária
+   * @param {string} key - Chave da métrica
+   * @param {number} value - Valor a definir
+   */
+  static setTempMetric(key, value) {
+    const stmt = dbPrivate.prepare(`
+      INSERT INTO temp_metrics (key, value, updated_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(key) DO UPDATE SET
+        value = excluded.value,
+        updated_at = CURRENT_TIMESTAMP
+    `);
+    stmt.run(key, value);
+  }
+
+  /**
+   * Incrementa uma métrica temporária
+   * @param {string} key - Chave da métrica
+   * @param {number} increment - Valor a incrementar (padrão: 1)
+   * @returns {number} Novo valor
+   */
+  static incrementTempMetric(key, increment = 1) {
+    const current = this.getTempMetric(key);
+    const newValue = current + increment;
+    this.setTempMetric(key, newValue);
+    return newValue;
+  }
+
+  /**
+   * Limpa métricas temporárias antigas (ex: diárias)
+   * @param {number} olderThanHours - Horas para considerar antigo
+   */
+  static cleanOldTempMetrics(olderThanHours = 24) {
+    const stmt = dbPrivate.prepare(`
+      DELETE FROM temp_metrics 
+      WHERE datetime(updated_at) < datetime('now', ?)
+    `);
+    stmt.run(`-${olderThanHours} hours`);
+  }
+
+  /**
+   * Busca estatísticas completas de um usuário para exibição
+   * @param {string} userId - JID do usuário
+   * @returns {Object} Estatísticas combinadas
+   */
+  static getUserStats(userId) {
+    if (!userId) return null;
+
+    const userMetrics = this.getUserMetrics(userId);
+    const waUser = this.getWaUser(userId);
+    const interactions = dbPrivate
+      .prepare("SELECT SUM(count) as total_interactions FROM luma_interactions WHERE sender_jid = ?")
+      .get(userId);
+
+    return {
+      user: waUser,
+      metrics: userMetrics || {
+        audios_downloaded: 0,
+        stickers_created: 0,
+        messages_sent: 0
+      },
+      interactions: interactions?.total_interactions || 0,
+      total_audios: userMetrics?.audios_downloaded || 0,
+      total_stickers: userMetrics?.stickers_created || 0,
+      total_messages: userMetrics?.messages_sent || 0,
+      last_active: userMetrics?.last_active || null
+    };
+  }
+
+  // ========== MÉTRICAS DE ÁUDIO ESPECÍFICAS ==========
+
+  /**
+   * Incrementa o contador de áudios baixados para um usuário
+   * @param {string} userId - JID do usuário
+   */
+  static incrementAudioDownload(userId) {
+    // Métrica global
+    this.incrementMetric("audios_downloaded");
+    this.incrementMetric("total_messages");
+    
+    // Métrica por usuário
+    this.updateUserMetric(userId, {
+      audios_downloaded: 1,
+      last_audio_download: new Date().toISOString()
+    });
+  }
+
+  /**
+   * Incrementa o contador de stickers criados para um usuário
+   * @param {string} userId - JID do usuário
+   */
+  static incrementStickerCreated(userId) {
+    this.incrementMetric("stickers_created");
+    this.updateUserMetric(userId, {
+      stickers_created: 1
+    });
+  }
+
+  /**
+   * Incrementa o contador de mensagens para um usuário
+   * @param {string} userId - JID do usuário
+   */
+  static incrementMessageSent(userId) {
+    this.incrementMetric("messages_sent");
+    this.updateUserMetric(userId, {
+      messages_sent: 1
+    });
+  }
+
+  /**
+   * Busca estatísticas de áudio para dashboard
+   * @returns {Object} Estatísticas agregadas
+   */
+  static getAudioStats() {
+    return {
+      total_audios: this.getMetric("audios_downloaded"),
+      total_messages: this.getMetric("total_messages"),
+      // Top usuários por downloads
+      top_users: dbPrivate
+        .prepare(`
+          SELECT user_id, audios_downloaded 
+          FROM user_metrics 
+          WHERE audios_downloaded > 0 
+          ORDER BY audios_downloaded DESC 
+          LIMIT 10
+        `)
+        .all(),
+      // Últimos downloads
+      recent_downloads: dbPrivate
+        .prepare(`
+          SELECT user_id, last_audio_download 
+          FROM user_metrics 
+          WHERE last_audio_download IS NOT NULL 
+          ORDER BY last_audio_download DESC 
+          LIMIT 20
+        `)
+        .all()
+    };
   }
 }
