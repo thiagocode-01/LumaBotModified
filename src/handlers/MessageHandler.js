@@ -60,11 +60,25 @@ export class MessageHandler {
   static get pluginManager() { return (this.#pm ??= buildPluginManager()); }
 
   static async process(bot) {
+    console.log("CHEGUEI NO MESSAGE HANDLER");
     if (CONFIG.IGNORE_SELF && bot.isFromMe) return;
-    if (bot.isGroup && !bot.isFromMe) SpontaneousHandler.trackActivity(bot.jid);
+
+    if (bot.isGroup && !bot.isFromMe) {
+      SpontaneousHandler.trackActivity(bot.jid);
+    }
+
     const command = CommandRouter.detect(bot.body, {
-      hasStickerSource: bot.hasVisualContent || bot.quotedHasVisualContent || !!extractUrl(bot.body),
+      hasStickerSource:
+        bot.hasVisualContent ||
+        bot.quotedHasVisualContent ||
+        !!extractUrl(bot.body),
     });
+
+    console.log("================================");
+    console.log("Mensagem recebida:", bot.body);
+    console.log("Comando detectado:", command);
+    console.log("================================");
+
     await MessageHandler.pluginManager.dispatch(command, bot);
   }
 }
